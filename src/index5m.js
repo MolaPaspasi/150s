@@ -324,7 +324,7 @@ async function settleWithBinance(trade, conf) {
   if (!closePrice) return null;
   // Strike'a %0.05'ten yakınsa belirsiz → Polymarket API'ye bırak (yanlış saymak yerine bekle)
   const margin = Math.abs(closePrice - trade.strikePrice) / trade.strikePrice;
-  if (margin < 0.0005) return null;
+  if (margin < 0.001) return null;
   return closePrice > trade.strikePrice ? "UP" : "DOWN";
 }
 
@@ -340,38 +340,30 @@ async function settleOpenTrades(name, assetConf, stats) {
 
     let winner = null;
 
-    // Method 1: Binance kline (ground truth — Chainlink da Binance zincirli oracle kullanır)
-    // Round bittikten 30s sonra kline kesinleşmiş olur
-    if (now >= trade.marketEndMs + 30_000) {
-      winner = await settleWithBinance(trade, assetConf.conf);
-    }
+    // Method 1: Polymarket oracle (gerçek settlement kaynağı — Chainlink'e eşdeğer)
+    try {
+      const market = await fetchResolvedMarket(trade.slug);
+      if (market) {
+        const prices   = Array.isArray(market.outcomePrices)
+          ? market.outcomePrices : JSON.parse(market.outcomePrices || "[]");
+        const outcomes = Array.isArray(market.outcomes)
+          ? market.outcomes : JSON.parse(market.outcomes || "[]");
 
-    // Method 2: Polymarket API fallback (closed market)
-    if (!winner) {
-      try {
-        const market = await fetchResolvedMarket(trade.slug);
-        if (market) {
-          const prices   = Array.isArray(market.outcomePrices)
-            ? market.outcomePrices : JSON.parse(market.outcomePrices || "[]");
-          const outcomes = Array.isArray(market.outcomes)
-            ? market.outcomes : JSON.parse(market.outcomes || "[]");
-
-          let maxP = 0, maxIdx = -1;
-          for (let i = 0; i < prices.length; i++) {
-            const p = parseFloat(prices[i] || "0");
-            if (p > maxP) { maxP = p; maxIdx = i; }
-          }
-          if (maxP >= 0.85 && maxIdx >= 0) {
-            const lbl = String(outcomes[maxIdx] || "").toLowerCase();
-            if (["up", "yes", "higher"].includes(lbl))   winner = "UP";
-            if (["down", "no", "lower"].includes(lbl)) winner = "DOWN";
-          }
+        let maxP = 0, maxIdx = -1;
+        for (let i = 0; i < prices.length; i++) {
+          const p = parseFloat(prices[i] || "0");
+          if (p > maxP) { maxP = p; maxIdx = i; }
         }
-      } catch { /* skip */ }
-    }
+        if (maxP >= 0.95 && maxIdx >= 0) {
+          const lbl = String(outcomes[maxIdx] || "").toLowerCase();
+          if (["up", "yes", "higher"].includes(lbl))   winner = "UP";
+          if (["down", "no", "lower"].includes(lbl)) winner = "DOWN";
+        }
+      }
+    } catch { /* skip */ }
 
-    // Method 3: 5dk sonra hâlâ çözülemediyse — Binance'i zorla çek
-    if (!winner && now >= trade.marketEndMs + 5 * 60_000) {
+    // Method 2: Binance kline fallback — sadece 10dk sonra ve strike'tan %0.1+ uzaksa
+    if (!winner && now >= trade.marketEndMs + 10 * 60_000) {
       winner = await settleWithBinance(trade, assetConf.conf);
     }
 
