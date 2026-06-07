@@ -70,7 +70,8 @@ const MIN_PRICE       = parseFloat(process.env.SNIPE_5M_MIN_PRICE     || "0.10")
 const MAX_PRICE       = parseFloat(process.env.SNIPE_5M_MAX_PRICE     || "0.95");
 const POLL_MS              = 1000;
 const STOP_LOSS_PCT        = parseFloat(process.env.SNIPE_5M_STOP_LOSS_PCT   || process.env.STOP_LOSS_PCT   || "35") / 100;
-const SIGNAL_REVERSE_PCT   = parseFloat(process.env.SNIPE_5M_SIGNAL_REVERSE_PCT || "0.003"); // %0.3 ters sinyal → çık
+const SIGNAL_REVERSE_PCT   = parseFloat(process.env.SNIPE_5M_SIGNAL_REVERSE_PCT || "0"); // 0 = kapalı
+const OBSERVE_SECONDS      = parseInt(process.env.SNIPE_5M_OBSERVE_SECONDS || "150");    // T-150s gözlem
 const POS_CHECK_MS         = 5_000; // 5 saniyede bir pozisyon kontrol et
 const BINANCE_BASE    = "https://api.binance.com";
 
@@ -538,6 +539,9 @@ function renderDashboard(rows, now) {
 
 // ─── Main loop ────────────────────────────────────────────────────────────────
 
+// slug → { direction, confidence, binancePrice, strikePrice, recordedAt }
+const preSignals = {};
+
 async function main() {
   const trader      = new TradingEngine();
   await trader.init();
@@ -600,7 +604,24 @@ async function main() {
       row.binancePrice = binancePrice;
 
       if (remainingS > WINDOW_SECONDS) {
-        row.status = `Waiting ${formatRem(remainingMs - WINDOW_SECONDS * 1000)} to window`;
+        // T-150s gözlem penceresi: sinyal kaydet, trade yok
+        if (remainingS <= OBSERVE_SECONDS && binancePrice && !preSignals[market.slug]) {
+          const strikePre = await getOpeningPrice(name, conf, market);
+          if (strikePre) {
+            const deltaPre = binancePrice - strikePre;
+            const confPre  = Math.abs(deltaPre) / strikePre;
+            const dirPre   = deltaPre > 0 ? "UP" : "DOWN";
+            preSignals[market.slug] = { direction: dirPre, confidence: confPre, binancePrice, strikePrice: strikePre, recordedAt: now };
+            row.status = `👁 T-150s obs: ${dirPre} ${(confPre*100).toFixed(3)}% | window in ${formatRem(remainingMs - WINDOW_SECONDS * 1000)}`;
+          } else {
+            row.status = `Waiting ${formatRem(remainingMs - WINDOW_SECONDS * 1000)} to window`;
+          }
+        } else if (preSignals[market.slug]) {
+          const p = preSignals[market.slug];
+          row.status = `👁 ${p.direction} ${(p.confidence*100).toFixed(3)}% kaydedildi | window in ${formatRem(remainingMs - WINDOW_SECONDS * 1000)}`;
+        } else {
+          row.status = `Waiting ${formatRem(remainingMs - WINDOW_SECONDS * 1000)} to window`;
+        }
         rows.push(row); continue;
       }
 
@@ -674,7 +695,7 @@ async function main() {
         row.status = `⚡ DRY RUN ${direction}@${askPrice.toFixed(3)} | conf:${confPct}% | ~${estShares} shares`;
         log(`⚡ [5m/${name}] DRY ${direction}@$${askPrice.toFixed(3)} | conf:${confPct}% | ~${estShares}sh | rem:${formatRem(remainingMs)}`);
         notifyTrade({ asset: `5m/${name}`, side: direction, price: askPrice, amount: TRADE_AMOUNT, shares: estShares, type: "DRY RUN" });
-        st.stats.trades.push({ slug: market.slug, side: direction, askPrice, amount: TRADE_AMOUNT, shares: estShares, profitIfWin: estShares * profitIfWin, confidence, strikePrice, binancePrice, marketEndMs: endMs, settled: false, dryRun: true });
+        st.stats.trades.push({ slug: market.slug, side: direction, askPrice, amount: TRADE_AMOUNT, shares: estShares, profitIfWin: estShares * profitIfWin, confidence, strikePrice, binancePrice, marketEndMs: endMs, settled: false, dryRun: true, pre150s: preSignals[market.slug] ?? null });
         saveStats(name, st.stats);
         rows.push(row); continue;
       }
@@ -682,7 +703,7 @@ async function main() {
       try {
         const result = await trader.executeTrade(tokenId, direction, TRADE_AMOUNT, false, askPrice);
         const shares = result.fillShares || estShares;
-        const trade  = { slug: market.slug, side: direction, askPrice, amount: TRADE_AMOUNT, shares, profitIfWin: parseFloat((shares * profitIfWin).toFixed(4)), tokenId, confidence, strikePrice, binancePrice, marketEndMs: endMs, settled: false };
+        const trade  = { slug: market.slug, side: direction, askPrice, amount: TRADE_AMOUNT, shares, profitIfWin: parseFloat((shares * profitIfWin).toFixed(4)), tokenId, confidence, strikePrice, binancePrice, marketEndMs: endMs, settled: false, pre150s: preSignals[market.slug] ?? null };
         st.stats.trades.push(trade);
         saveStats(name, st.stats);
 

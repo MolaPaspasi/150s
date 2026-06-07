@@ -162,7 +162,41 @@ for (const name of ASSETS) {
   console.log(`${name.padEnd(8)} ${(pct(upW, up.length) + ` (${up.length})`).padStart(10)} ${(pct(dnW, down.length) + ` (${down.length})`).padStart(10)}`);
 }
 
-// ── 7. Ham trade verisi (CSV) ─────────────────────────────────────────────────
+// ── 7. T-150s Pre-Signal Analizi ─────────────────────────────────────────────
+section("T-150s PRE-SİNYAL ANALİZİ");
+console.log("(T-150s gözlemi ile T-89s gerçek trade sinyali karşılaştırması)\n");
+
+const withPre  = allTrades.filter(t => t.pre150s);
+const noPre    = allTrades.filter(t => !t.pre150s);
+
+if (withPre.length === 0) {
+  console.log("  Henüz T-150s verisi yok — bot güncellendikten sonra birikecek.");
+} else {
+  const sameDir = withPre.filter(t => t.pre150s.direction === t.side);
+  const diffDir = withPre.filter(t => t.pre150s.direction !== t.side);
+
+  const winCount = t => (t.result === "WIN" || t.result === "TP") ? 1 : 0;
+
+  const sameDirW = sameDir.reduce((s, t) => s + winCount(t), 0);
+  const diffDirW = diffDir.reduce((s, t) => s + winCount(t), 0);
+
+  console.log(`Pre-sinyal VAR: ${withPre.length} trade  |  Pre-sinyal YOK: ${noPre.length} trade\n`);
+  console.log(`Aynı yön  (pre=entry): ${String(sameDir.length).padStart(3)} trade  WR: ${pct(sameDirW, sameDir.length).padStart(6)}`);
+  console.log(`Farklı yön(pre≠entry): ${String(diffDir.length).padStart(3)} trade  WR: ${pct(diffDirW, diffDir.length).padStart(6)}`);
+
+  console.log(`\nYorum:`);
+  if (sameDir.length > 5 && diffDir.length > 5) {
+    const sWr = sameDirW / sameDir.length;
+    const dWr = diffDirW / diffDir.length;
+    if (sWr > dWr + 0.05) console.log(`  → Aynı yön daha yüksek WR — T-150s filtresi faydalı olabilir`);
+    else if (dWr > sWr + 0.05) console.log(`  → Farklı yön daha yüksek WR — reversal sinyali değerli olabilir`);
+    else console.log(`  → Anlamlı fark yok — T-150s sinyali şimdilik bilgi vermiyor`);
+  } else {
+    console.log(`  → Yeterli veri yok (her grupta en az 5 trade gerekli)`);
+  }
+}
+
+// ── 8. Ham trade verisi (CSV) ─────────────────────────────────────────────────
 section("HAM VERİ — TÜM TRADE'LER (CSV)");
 console.log("asset,side,confidence_pct,strike,binanceAtFire,askPrice,shares,result,exitType,pnl,time_utc");
 
