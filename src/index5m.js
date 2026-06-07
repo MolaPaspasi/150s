@@ -664,6 +664,14 @@ async function main() {
         rows.push(row); continue;
       }
 
+      // T-150s filtresi: T-150s ile T-89s aynı yönde ise momentum zaten fiyatlanmış →
+      // piyasa genelde tersine döner (veri: %23.5 WR). Sadece reversal sinyallerinde gir.
+      const pre150 = preSignals[market.slug];
+      if (pre150 && pre150.direction === direction) {
+        row.status = `Skip — T-150s(${pre150.direction})=T-89s(${direction}) → mean-reversion riski`;
+        rows.push(row); continue;
+      }
+
       // Orderbook fiyatlarını al
       const prices = await fetchAskPrices(market, conf);
       if (!prices) {
