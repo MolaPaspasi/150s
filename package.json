@@ -1,0 +1,21 @@
+{
+  "name": "polyassistent",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node --max-old-space-size=512 src/index.js",
+    "start5m": "node --max-old-space-size=512 src/index5m.js"
+  },
+  "dependencies": {
+    "@polymarket/clob-client-v2": "^1.0.2",
+    "dotenv": "^17.3.1",
+    "ethers": "^6.11.1",
+    "https-proxy-agent": "^7.0.6",
+    "node-telegram-bot-api": "^0.67.0",
+    "polyassistent": "file:../pompav3",
+    "socks-proxy-agent": "^8.0.5",
+    "undici": "^6.21.3",
+    "ws": "^8.18.0"
+  }
+}
