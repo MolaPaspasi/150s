@@ -1,4 +1,6 @@
 import TelegramBot from "node-telegram-bot-api";
+import fs from "fs";
+import path from "path";
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
@@ -202,14 +204,82 @@ function _registerCommands() {
     send(msg2);
   });
 
+  bot.onText(/\/winstats/, () => {
+    const LOGS_DIR = "./logs";
+    const ASSETS   = ["BTC", "ETH", "SOL", "DOGE", "XRP", "BNB"];
+    const allTrades = [];
+    for (const name of ASSETS) {
+      try {
+        const s = JSON.parse(fs.readFileSync(path.join(LOGS_DIR, `stats5m_${name}.json`), "utf8"));
+        (s.trades || []).filter(t => t.settled && t.result && !t.dryRun).forEach(t => allTrades.push({ ...t, asset: name }));
+      } catch { /* skip */ }
+    }
+    if (!allTrades.length) { send("📊 Henüz live settle trade yok."); return; }
+
+    const isWin = t => t.result === "WIN" || t.result === "TP";
+    const pct   = (w, t) => t ? `${((w/t)*100).toFixed(0)}%` : "—";
+
+    // Per asset
+    const lines = ASSETS.map(name => {
+      const ts = allTrades.filter(t => t.asset === name);
+      if (!ts.length) return null;
+      const w = ts.filter(isWin).length;
+      return `${name.padEnd(5)} ${w}W/${(ts.length-w)}L ${pct(w, ts.length).padStart(4)}`;
+    }).filter(Boolean);
+
+    // UP vs DOWN
+    const up   = allTrades.filter(t => t.side === "UP");
+    const down = allTrades.filter(t => t.side === "DOWN");
+    const upW  = up.filter(isWin).length;
+    const dnW  = down.filter(isWin).length;
+
+    // 150s karşılaştırma
+    const withPre = allTrades.filter(t => t.pre150s);
+    const same    = withPre.filter(t => t.pre150s.direction === t.side);
+    const diff    = withPre.filter(t => t.pre150s.direction !== t.side);
+    const sameW   = same.filter(isWin).length;
+    const diffW   = diff.filter(isWin).length;
+
+    const totalW = allTrades.filter(isWin).length;
+    const total  = allTrades.length;
+
+    const pre150Lines = withPre.length
+      ? [`Aynı yön:   ${same.length} trade → WR ${pct(sameW, same.length)}`,
+         `Farklı yön: ${diff.length} trade → WR ${pct(diffW, diff.length)}`]
+      : ["(T-150s verisi henüz yok)"];
+
+    send([
+      `📊 *Win Stats* — ${total} live trade`,
+      ``,
+      `*── PER ASSET ──*`,
+      "```",
+      ...lines,
+      `${"─".repeat(22)}`,
+      `TOTAL ${totalW}W/${total-totalW}L ${pct(totalW, total).padStart(4)}`,
+      "```",
+      ``,
+      `*── YÖN ──*`,
+      `UP:   ${up.length} trade → WR ${pct(upW, up.length)}`,
+      `DOWN: ${down.length} trade → WR ${pct(dnW, down.length)}`,
+      ``,
+      `*── T-150s vs T-89s ──*`,
+      ...pre150Lines,
+    ].join("\n"));
+  });
+
   bot.onText(/\/help/, () => {
-    send(`*Hadi Bot Commands*\n/stop — pause all trading\n/start — resume trading\n/balance — P&L per asset\n/trades — open positions\n/stats — win rate per asset\n/analyze — full diagnostic dump`);
+    send(`*Hadi Bot Commands*\n/stop — pause all trading\n/start — resume trading\n/balance — P&L per asset\n/trades — open positions\n/stats — win rate per asset\n/winstats — W/L + 150s karşılaştırması\n/analyze — full diagnostic dump`);
   });
 }
 
 function send(text) {
   if (!bot || !CHAT_ID) return;
   bot.sendMessage(CHAT_ID, text, { parse_mode: "Markdown" }).catch(() => {});
+}
+
+export function notifyObserve({ asset, direction, confidence, windowSec }) {
+  const emoji = direction === "UP" ? "🟡" : "🟠";
+  send(`${emoji} *T-150s — ${asset}*\nYön: ${direction} | Conf: ${(confidence*100).toFixed(3)}% | ${windowSec}s sonra giriş`);
 }
 
 export function notifyTrade({ asset, side, price, amount, shares, type }) {

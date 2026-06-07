@@ -29,7 +29,7 @@ import { startBinanceTradeStream } from "./data/binanceWs.js";
 import { TradingEngine } from "./engines/trading.js";
 import { applyGlobalProxyFromEnv } from "./net/proxy.js";
 import { sleep } from "./utils.js";
-import { initTelegram, notifyTrade, notifyResult } from "./services/telegram.js";
+import { initTelegram, notifyTrade, notifyResult, notifyObserve } from "./services/telegram.js";
 import fs from "fs";
 import path from "path";
 
@@ -613,6 +613,7 @@ async function main() {
             const dirPre   = deltaPre > 0 ? "UP" : "DOWN";
             preSignals[market.slug] = { direction: dirPre, confidence: confPre, binancePrice, strikePrice: strikePre, recordedAt: now };
             row.status = `👁 T-150s obs: ${dirPre} ${(confPre*100).toFixed(3)}% | window in ${formatRem(remainingMs - WINDOW_SECONDS * 1000)}`;
+            if (confPre >= MIN_CONFIDENCE) notifyObserve({ asset: `5m/${name}`, direction: dirPre, confidence: confPre, windowSec: Math.round((remainingMs - WINDOW_SECONDS * 1000) / 1000) });
           } else {
             row.status = `Waiting ${formatRem(remainingMs - WINDOW_SECONDS * 1000)} to window`;
           }
