@@ -341,39 +341,39 @@ async function settleOpenTrades(name, assetConf, stats) {
 
     let winner = null;
 
-    // Method 1: Binance kline (ground truth — Chainlink da Binance zincirli oracle kullanır)
-    // Round bittikten 30s sonra kline kesinleşmiş olur
-    if (now >= trade.marketEndMs + 30_000) {
-      winner = await settleWithBinance(trade, assetConf.conf);
-    }
-
-    // Method 2: Polymarket API fallback (closed market)
-    if (!winner) {
-      try {
-        const market = await fetchResolvedMarket(trade.slug);
-        if (market) {
-          const prices   = Array.isArray(market.outcomePrices)
-            ? market.outcomePrices : JSON.parse(market.outcomePrices || "[]");
-          const outcomes = Array.isArray(market.outcomes)
-            ? market.outcomes : JSON.parse(market.outcomes || "[]");
-
-          let maxP = 0, maxIdx = -1;
-          for (let i = 0; i < prices.length; i++) {
-            const p = parseFloat(prices[i] || "0");
-            if (p > maxP) { maxP = p; maxIdx = i; }
-          }
-          if (maxP >= 0.85 && maxIdx >= 0) {
-            const lbl = String(outcomes[maxIdx] || "").toLowerCase();
-            if (["up", "yes", "higher"].includes(lbl))   winner = "UP";
-            if (["down", "no", "lower"].includes(lbl)) winner = "DOWN";
-          }
+    // Method 1: Polymarket outcomePrices — tek gerçek kaynak (Chainlink oracle sonucu)
+    // %95+ eşiği: 0.85 yeterliydi ama yanlış okumayı önlemek için daha katı
+    try {
+      const market = await fetchResolvedMarket(trade.slug);
+      if (market) {
+        const prices   = Array.isArray(market.outcomePrices)
+          ? market.outcomePrices : JSON.parse(market.outcomePrices || "[]");
+        const outcomes = Array.isArray(market.outcomes)
+          ? market.outcomes : JSON.parse(market.outcomes || "[]");
+        let maxP = 0, maxIdx = -1;
+        for (let i = 0; i < prices.length; i++) {
+          const p = parseFloat(prices[i] || "0");
+          if (p > maxP) { maxP = p; maxIdx = i; }
         }
-      } catch { /* skip */ }
-    }
+        if (maxP >= 0.95 && maxIdx >= 0) {
+          const lbl = String(outcomes[maxIdx] || "").toLowerCase();
+          if (["up", "yes", "higher"].includes(lbl)) winner = "UP";
+          if (["down", "no", "lower"].includes(lbl)) winner = "DOWN";
+        }
+      }
+    } catch { /* skip */ }
 
-    // Method 3: 5dk sonra hâlâ çözülemediyse — Binance'i zorla çek
-    if (!winner && now >= trade.marketEndMs + 5 * 60_000) {
-      winner = await settleWithBinance(trade, assetConf.conf);
+    // Method 2: Binance kline — sadece 10dk sonra ve strike'tan %0.1+ uzaksa (son çare)
+    // Polymarket resolve etmediyse ve çok zaman geçtiyse kullan
+    if (!winner && now >= trade.marketEndMs + 10 * 60_000) {
+      const closePrice = await fetchBinanceKlineClose(assetConf.conf.symbol, trade.marketEndMs);
+      if (closePrice && trade.strikePrice) {
+        const margin = Math.abs(closePrice - trade.strikePrice) / trade.strikePrice;
+        if (margin >= 0.001) { // %0.1 net fark — belirsiz değil
+          winner = closePrice > trade.strikePrice ? "UP" : "DOWN";
+          log(`⚠️ [5m/${name}] Binance fallback settlement kullanıldı (Polymarket 10dk'da resolve etmedi)`);
+        }
+      }
     }
 
     if (!winner) continue;
@@ -612,6 +612,9 @@ async function main() {
             const confPre  = Math.abs(deltaPre) / strikePre;
             const dirPre   = deltaPre > 0 ? "UP" : "DOWN";
             preSignals[market.slug] = { direction: dirPre, confidence: confPre, binancePrice, strikePrice: strikePre, recordedAt: now };
+            row.strikePrice = strikePre;
+            row.confidence  = confPre;
+            row.direction   = dirPre;
             row.status = `👁 T-150s obs: ${dirPre} ${(confPre*100).toFixed(3)}% | window in ${formatRem(remainingMs - WINDOW_SECONDS * 1000)}`;
             if (confPre >= MIN_CONFIDENCE) notifyObserve({ asset: `5m/${name}`, direction: dirPre, confidence: confPre, windowSec: Math.round((remainingMs - WINDOW_SECONDS * 1000) / 1000) });
           } else {
@@ -619,6 +622,9 @@ async function main() {
           }
         } else if (preSignals[market.slug]) {
           const p = preSignals[market.slug];
+          row.strikePrice = p.strikePrice;
+          row.confidence  = p.confidence;
+          row.direction   = p.direction;
           row.status = `👁 ${p.direction} ${(p.confidence*100).toFixed(3)}% kaydedildi | window in ${formatRem(remainingMs - WINDOW_SECONDS * 1000)}`;
         } else {
           row.status = `Waiting ${formatRem(remainingMs - WINDOW_SECONDS * 1000)} to window`;
