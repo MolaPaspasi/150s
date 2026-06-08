@@ -20,8 +20,7 @@
  *     --jump-bps 5 --min-edge-cents 2 --react-window-s 4
  * =================================================================== */
 
-'use strict';
-const fs = require('fs');
+import fs from 'fs';
 
 /* ---------- CSV parse (tırnaklı alanları destekler) ---------- */
 function parseCsvLine(line) {
@@ -323,5 +322,7 @@ function main() {
   verdict(ll, ev, a.execP95);
 }
 
-if (require.main === module) main();
-module.exports = { loadCsv, resampleRound, leadLag, staleEvents, vwapFill };
+export { loadCsv, resampleRound, leadLag, staleEvents, vwapFill };
+
+// CLI olarak doğrudan çalıştırılırsa: node analyzeLatencyEdge.js ...
+if (process.argv[1] && process.argv[1].replace(/\\/g, '/').endsWith('analyzeLatencyEdge.js')) main();

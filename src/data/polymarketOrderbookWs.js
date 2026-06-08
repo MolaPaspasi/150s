@@ -13,6 +13,7 @@ class PolymarketOrderbookWs {
         this.reconnectTimer = null;
         this.pingInterval = null;
         this.cleanupInterval = null;
+        this.onBookUpdate = null; // optional: (tokenId, { bestBid, bestAsk }) => void
     }
 
     start() {
@@ -164,6 +165,9 @@ class PolymarketOrderbookWs {
                     if (bestAsk !== null) current.bestAsk = bestAsk;
                     current.lastUpdate = Date.now();
                     this.cache[tokenId] = current;
+                    if (this.onBookUpdate) {
+                        try { this.onBookUpdate(tokenId, { bestBid: current.bestBid, bestAsk: current.bestAsk }); } catch {}
+                    }
                 }
             }
         }

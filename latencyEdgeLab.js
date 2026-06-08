@@ -23,10 +23,8 @@
  * WS callback'leri ve kayıt döngüsü aynı loop'ta çalışır.
  * =================================================================== */
 
-'use strict';
-
-const fs = require('fs');
-const { performance } = require('perf_hooks');
+import fs from 'fs';
+import { performance } from 'perf_hooks';
 
 const mono = () => performance.now() / 1000; // saniye (monotonik)
 const wall = () => Date.now() / 1000;        // epoch saniye (insan-okunur)
@@ -249,12 +247,12 @@ class LatencyProbe {
   }
 }
 
-module.exports = { StalenessRecorder, LatencyProbe, mono, wall, COLUMNS };
+export { StalenessRecorder, LatencyProbe, mono, wall, COLUMNS };
 
 /* -------------------------------------------------------------------
  * Doğrudan çalıştırılırsa: WS olmadan duman testi
  * ----------------------------------------------------------------- */
-if (require.main === module) {
+if (process.argv[1] && new URL(import.meta.url).pathname.endsWith(process.argv[1].replace(/\\/g, '/'))) {
   (async () => {
     const rec = new StalenessRecorder('staleness_log_demo.csv',
       ['BTC', 'ETH'], { tickMs: 100, recordOnlyLastSecs: 120 });

@@ -30,6 +30,7 @@ import { TradingEngine } from "./engines/trading.js";
 import { applyGlobalProxyFromEnv } from "./net/proxy.js";
 import { sleep } from "./utils.js";
 import { initTelegram, notifyTrade, notifyResult, notifyObserve } from "./services/telegram.js";
+import { StalenessRecorder } from "../latencyEdgeLab.js";
 import fs from "fs";
 import path from "path";
 
@@ -91,6 +92,15 @@ if (!ASSETS.length) {
 const binancePrices = {};
 const binanceStreams = {};
 
+// ─── Latency Edge Lab — pasif ölçüm (trade etmez, CSV'ye yazar) ──────────────
+const _tokenMeta = {}; // tokenId → { name, dir: 'UP'|'DOWN' }
+const _bookState = {}; // name → { askUp, askDown, bidUp, bidDown }
+for (const { name: n } of ASSETS) _bookState[n] = {};
+
+const _stalenessPath = path.join("./logs", `staleness_${new Date().toISOString().slice(0,10)}.csv`);
+const _rec = new StalenessRecorder(_stalenessPath, ASSETS.map(a => a.name), { tickMs: 200, recordOnlyLastSecs: 120 });
+_rec.start();
+
 for (const { name, conf } of ASSETS) {
   const symbol = conf.symbol;
   binancePrices[name] = { price: null, ts: null };
@@ -99,9 +109,23 @@ for (const { name, conf } of ASSETS) {
     symbol,
     onUpdate: ({ price, ts }) => {
       binancePrices[name] = { price, ts };
+      _rec.onBinanceTrade(name, price, ts); // latency lab hook
     },
   });
 }
+
+// Polymarket orderbook WS hook — her book güncellemesinde çağrılır
+polyOrderbookWs.onBookUpdate = (tokenId, { bestAsk, bestBid }) => {
+  const meta = _tokenMeta[tokenId];
+  if (!meta) return;
+  const { name, dir } = meta;
+  if (dir === 'UP')   { _bookState[name].askUp = bestAsk; _bookState[name].bidUp = bestBid; }
+  else                { _bookState[name].askDown = bestAsk; _bookState[name].bidDown = bestBid; }
+  _rec.onPmBook(name, {
+    askUp:   _bookState[name].askUp,   askDown: _bookState[name].askDown,
+    bidUp:   _bookState[name].bidUp,   bidDown: _bookState[name].bidDown,
+  });
+};
 
 function getBinancePrice(name) {
   const { price, ts } = binancePrices[name] || {};
@@ -652,6 +676,9 @@ async function main() {
         rows.push(row); continue;
       }
 
+      // Latency lab: round bilgisini kayıt et (her tick'te günceller, idempotent)
+      _rec.setRound(name, market.slug, strikePrice, endMs / 1000);
+
       // Oracle signal
       const delta      = binancePrice - strikePrice;
       const confidence = Math.abs(delta) / strikePrice;
@@ -680,6 +707,12 @@ async function main() {
       }
       row.askUp   = prices.askUp;
       row.askDown = prices.askDown;
+
+      // Latency lab: token → asset eşlemesini kaydet (ilk görüldüğünde)
+      if (prices.upTokenId && !_tokenMeta[prices.upTokenId]) {
+        _tokenMeta[prices.upTokenId]   = { name, dir: 'UP' };
+        _tokenMeta[prices.downTokenId] = { name, dir: 'DOWN' };
+      }
 
       if (!prices.askUp || !prices.askDown) {
         const askDir = direction === "UP" ? prices.askUp : prices.askDown;
