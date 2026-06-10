@@ -92,6 +92,22 @@ if (!ASSETS.length) {
 
 const binancePrices = {};
 const binanceStreams = {};
+// Rolling 15dk log-return std → vol-normalized z-score için
+const _priceHistory = {}; // name → [{price, ts}] (son 15dk)
+const ROLLING_VOL_WINDOW_MS = 15 * 60_000;
+function getRollingVol(name) {
+  const hist = _priceHistory[name];
+  if (!hist || hist.length < 5) return null;
+  const cutoff = Date.now() - ROLLING_VOL_WINDOW_MS;
+  const recent = hist.filter(h => h.ts >= cutoff);
+  if (recent.length < 5) return null;
+  const returns = [];
+  for (let i = 1; i < recent.length; i++)
+    returns.push(Math.log(recent[i].price / recent[i-1].price));
+  const mean = returns.reduce((a,b)=>a+b,0)/returns.length;
+  const variance = returns.reduce((a,r)=>a+(r-mean)**2,0)/returns.length;
+  return Math.sqrt(variance) || null;
+}
 
 // ─── Latency Edge Lab — pasif ölçüm (trade etmez, CSV'ye yazar) ──────────────
 const _tokenMeta = {}; // tokenId → { name, dir: 'UP'|'DOWN' }
@@ -111,7 +127,13 @@ for (const { name, conf } of ASSETS) {
     symbol,
     onUpdate: ({ price, ts }) => {
       binancePrices[name] = { price, ts };
-      _rec.onBinanceTrade(name, price, ts); // latency lab hook
+      _rec.onBinanceTrade(name, price, ts);
+      if (!_priceHistory[name]) _priceHistory[name] = [];
+      _priceHistory[name].push({ price, ts });
+      // Pencereyi 20dk'da tut (bellek)
+      const cutoff = ts - 20 * 60_000;
+      while (_priceHistory[name].length && _priceHistory[name][0].ts < cutoff)
+        _priceHistory[name].shift();
     },
   });
 }
@@ -827,7 +849,8 @@ async function main() {
       try {
         const result = await trader.executeTrade(tokenId, direction, TRADE_AMOUNT, false, askPrice);
         const shares = result.fillShares || estShares;
-        const trade  = { slug: market.slug, side: direction, askPrice, amount: TRADE_AMOUNT, shares, profitIfWin: parseFloat((shares * profitIfWin).toFixed(4)), tokenId, confidence, strikePrice, binancePrice, marketEndMs: endMs, settled: false, pre150s: preSignals[market.slug] ?? null };
+        const _vol = getRollingVol(name);
+        const trade  = { slug: market.slug, side: direction, askPrice, amount: TRADE_AMOUNT, shares, profitIfWin: parseFloat((shares * profitIfWin).toFixed(4)), tokenId, confidence, strikePrice, binancePrice, marketEndMs: endMs, settled: false, pre150s: preSignals[market.slug] ?? null, volZ: _vol ? parseFloat((confidence/_vol).toFixed(3)) : null };
         if (result.success) {
           st.stats.trades.push(trade);
           saveStats(name, st.stats);
