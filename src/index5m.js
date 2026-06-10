@@ -67,6 +67,7 @@ initTelegram();
 const WINDOW_SECONDS  = parseInt(process.env.SNIPE_5M_WINDOW_SECONDS  || "90");
 const TRADE_AMOUNT    = parseFloat(process.env.SNIPE_5M_AMOUNT_USDC   || "10");
 const MIN_CONFIDENCE  = parseFloat(process.env.SNIPE_5M_MIN_CONFIDENCE || "0.001"); // 0.10%
+const MAX_CONFIDENCE  = parseFloat(process.env.SNIPE_5M_MAX_CONFIDENCE || "1.0");   // default: sınırsız
 const MIN_PRICE       = parseFloat(process.env.SNIPE_5M_MIN_PRICE     || "0.10");
 const MAX_PRICE       = parseFloat(process.env.SNIPE_5M_MAX_PRICE     || "0.95");
 const POLL_MS              = 1000;
@@ -726,6 +727,10 @@ async function main() {
 
       if (confidence < MIN_CONFIDENCE) {
         row.status = `Skip — conf ${(confidence*100).toFixed(3)}% < ${(MIN_CONFIDENCE*100).toFixed(2)}% (${formatRem(remainingMs)})`;
+        rows.push(row); continue;
+      }
+      if (confidence > MAX_CONFIDENCE) {
+        row.status = `Skip — conf ${(confidence*100).toFixed(3)}% > ${(MAX_CONFIDENCE*100).toFixed(2)}% (aşırı hareket)`;
         rows.push(row); continue;
       }
 
