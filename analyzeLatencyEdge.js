@@ -20,7 +20,8 @@
  *     --jump-bps 5 --min-edge-cents 2 --react-window-s 4
  * =================================================================== */
 
-import fs from 'fs';
+import fs, { createReadStream } from 'fs';
+import readline from 'readline';
 
 /* ---------- CSV parse (tırnaklı alanları destekler) ---------- */
 function parseCsvLine(line) {
@@ -283,7 +284,7 @@ function verdict(ll, ev, execP95) {
   console.log(line);
 }
 
-/* ---------- arg parse + main ---------- */
+/* ---------- arg parse ---------- */
 function parseArgs(argv) {
   const a = { csv: null, gridMs: 50, jumpBps: 5, minEdgeCents: 2, reactWindowS: 4, orderUsd: 10, execP95: 120 };
   const map = {
@@ -297,24 +298,74 @@ function parseArgs(argv) {
   return a;
 }
 
-function main() {
-  const a = parseArgs(process.argv);
-  if (!a.csv) { console.error('Kullanım: node analyzeLatencyEdge.js <csv> [--exec-latency-p95-ms N] [--order-usd N] ...'); process.exit(1); }
-  const rows = loadCsv(a.csv);
-  if (!rows.length) { console.error('Boş CSV.'); process.exit(1); }
+/* ---------- satır-satır stream okuma — bellek OOM'u önler ---------- */
+const NEEDED_KEYS = [
+  'capture_mono', 'binance_price', 'strike', 'delta',
+  'pm_ask_up', 'pm_ask_down', 'pm_bid_up', 'pm_bid_down',
+  'pm_ask_up_size', 'pm_ask_down_size', 'pm_ask_up_levels', 'pm_ask_down_levels',
+  'round_id', 'asset',
+];
 
-  // (round_id, asset) grupla
-  const groups = new Map();
-  for (const r of rows) {
-    const k = `${r.round_id}|${r.asset}`;
-    if (!groups.has(k)) groups.set(k, []);
-    groups.get(k).push(r);
-  }
+async function streamAnalyze(csvPath, gridMs) {
+  const rl = readline.createInterface({
+    input: createReadStream(csvPath, { encoding: 'utf8' }),
+    crlfDelay: Infinity,
+  });
+
+  let header = null, colIdx = {}, rowCount = 0;
+  const active = new Map(); // asset → { roundId, rows[] }
   const grids = [];
-  for (const g of groups.values()) {
-    const gr = resampleRound(g, a.gridMs);
+
+  function flushGroup(g) {
+    const gr = resampleRound(g.rows, gridMs);
     if (gr && gr.ask.filter(isFinite).length > 5) grids.push(gr);
   }
+
+  for await (const rawLine of rl) {
+    const line = rawLine.replace(/\r$/, '');
+    if (!line) continue;
+    const fields = parseCsvLine(line);
+
+    if (!header) {
+      header = fields;
+      fields.forEach((h, i) => { colIdx[h] = i; });
+      continue;
+    }
+
+    const roundId = fields[colIdx['round_id']];
+    const asset   = fields[colIdx['asset']];
+    if (!roundId || !asset) continue;
+
+    rowCount++;
+
+    const g = active.get(asset);
+    if (g && g.roundId !== roundId) {
+      flushGroup(g);
+      active.delete(asset);
+    }
+
+    if (!active.has(asset)) active.set(asset, { roundId, rows: [] });
+
+    const row = {};
+    for (const k of NEEDED_KEYS) row[k] = colIdx[k] != null ? (fields[colIdx[k]] ?? '') : '';
+    active.get(asset).rows.push(row);
+  }
+
+  for (const g of active.values()) flushGroup(g);
+
+  console.log(`Yüklendi: ${rowCount.toLocaleString()} satır → ${grids.length} (round,asset) serisi`);
+  return grids;
+}
+
+/* ---------- main ---------- */
+async function main() {
+  const a = parseArgs(process.argv);
+  if (!a.csv) {
+    console.error('Kullanım: node analyzeLatencyEdge.js <csv> [--exec-latency-p95-ms N] [--order-usd N] ...');
+    process.exit(1);
+  }
+
+  const grids = await streamAnalyze(a.csv, a.gridMs);
   if (!grids.length) { console.error('Yeterli (round,asset) serisi yok.'); process.exit(1); }
 
   const ll = leadLag(grids, a.gridMs);
@@ -324,5 +375,5 @@ function main() {
 
 export { loadCsv, resampleRound, leadLag, staleEvents, vwapFill };
 
-// CLI olarak doğrudan çalıştırılırsa: node analyzeLatencyEdge.js ...
-if (process.argv[1] && process.argv[1].replace(/\\/g, '/').endsWith('analyzeLatencyEdge.js')) main();
+if (process.argv[1] && process.argv[1].replace(/\\/g, '/').endsWith('analyzeLatencyEdge.js'))
+  main().catch((e) => { console.error(e); process.exit(1); });

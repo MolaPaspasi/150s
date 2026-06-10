@@ -95,10 +95,11 @@ const binanceStreams = {};
 // ─── Latency Edge Lab — pasif ölçüm (trade etmez, CSV'ye yazar) ──────────────
 const _tokenMeta = {}; // tokenId → { name, dir: 'UP'|'DOWN' }
 const _bookState = {}; // name → { askUp, askDown, bidUp, bidDown }
+const _pmPollLastT = {}; // staleness REST poll throttle: asset → lastMs
 for (const { name: n } of ASSETS) _bookState[n] = {};
 
 const _stalenessPath = path.join("./logs", `staleness_${new Date().toISOString().slice(0,10)}.csv`);
-const _rec = new StalenessRecorder(_stalenessPath, ASSETS.map(a => a.name), { tickMs: 200, recordOnlyLastSecs: 120 });
+const _rec = new StalenessRecorder(_stalenessPath, ASSETS.map(a => a.name), { tickMs: 500, recordOnlyLastSecs: 120 });
 _rec.start();
 
 for (const { name, conf } of ASSETS) {
@@ -321,6 +322,30 @@ async function fetchAskPrices(market, assetConf) {
   const result = { askUp, askDown, upTokenId, downTokenId, t: Date.now() };
   _priceCache5m[slug] = result;
   return result;
+}
+
+// Staleness lab için cache bypass — sadece REST, cache güncellemez, levels dahil
+async function fetchAskPricesNoCache(market, assetConf) {
+  const { upTokenId, downTokenId } = extractTokenIds5m(market, assetConf);
+  if (!upTokenId || !downTokenId) return null;
+  try {
+    const [upBook, downBook] = await Promise.all([
+      fetchOrderBook({ tokenId: upTokenId }),
+      fetchOrderBook({ tokenId: downTokenId }),
+    ]);
+    const askUp   = upBook   ? summarizeOrderBook(upBook).bestAsk   : null;
+    const askDown = downBook ? summarizeOrderBook(downBook).bestAsk : null;
+    const extractLevels = (book) => {
+      if (!book?.asks?.length) return null;
+      return book.asks
+        .map(l => [parseFloat(l.price), parseFloat(l.size)])
+        .filter(([p, s]) => isFinite(p) && isFinite(s) && s > 0)
+        .sort((a, b) => a[0] - b[0])
+        .slice(0, 5);
+    };
+    return { askUp, askDown, upTokenId, downTokenId,
+      askUpLevels: extractLevels(upBook), askDownLevels: extractLevels(downBook) };
+  } catch { return null; }
 }
 
 // ─── Stats ────────────────────────────────────────────────────────────────────
@@ -570,7 +595,8 @@ async function main() {
   const trader      = new TradingEngine();
   await trader.init();
 
-  const snipedSlugs = new Set();
+  const snipedSlugs      = new Set();
+  const snipedRoundSlots = new Map(); // roundSlot → { name, confidence } — korelasyon koruması
   const assetState  = {};
   for (const { name } of ASSETS) {
     assetState[name] = { stats: loadStats(name), lastSettleMs: 0, lastExitCheckMs: 0 };
@@ -581,8 +607,9 @@ async function main() {
   await sleep(3000);
 
   while (true) {
-    const now  = Date.now();
-    const rows = [];
+    const now          = Date.now();
+    const rows         = [];
+    const pendingFires = new Map(); // roundSlot → candidate — bu tick'te ateşlenecek en iyi sinyal
 
     for (const { name, conf } of ASSETS) {
       const st  = assetState[name];
@@ -658,6 +685,17 @@ async function main() {
 
       // In window — zaten snipe yaptık mı?
       if (snipedSlugs.has(market.slug)) {
+        // Staleness lab: snipe sonrası PM fiyatını 5s'de bir REST'ten al
+        const _nowMs = Date.now();
+        if (remainingMs > 0 && remainingMs < 120_000 && _nowMs - (_pmPollLastT[name] || 0) >= 5_000) {
+          _pmPollLastT[name] = _nowMs;
+          fetchAskPricesNoCache(market, conf).then(p => {
+            if (p && (p.askUp || p.askDown)) _rec.onPmBook(name, {
+              askUp: p.askUp, askDown: p.askDown,
+              askUpLevels: p.askUpLevels, askDownLevels: p.askDownLevels,
+            });
+          }).catch(() => {});
+        }
         row.status = `⚡ SNIPED — waiting settlement (${formatRem(remainingMs)})`;
         rows.push(row); continue;
       }
@@ -699,6 +737,13 @@ async function main() {
         rows.push(row); continue;
       }
 
+      // Latency lab: token → asset eşlemesini WS subscribe'dan ÖNCE set et
+      const _earlyTokens = extractTokenIds5m(market, conf);
+      if (_earlyTokens.upTokenId && !_tokenMeta[_earlyTokens.upTokenId]) {
+        _tokenMeta[_earlyTokens.upTokenId]   = { name, dir: 'UP' };
+        _tokenMeta[_earlyTokens.downTokenId] = { name, dir: 'DOWN' };
+      }
+
       // Orderbook fiyatlarını al
       const prices = await fetchAskPrices(market, conf);
       if (!prices) {
@@ -708,10 +753,9 @@ async function main() {
       row.askUp   = prices.askUp;
       row.askDown = prices.askDown;
 
-      // Latency lab: token → asset eşlemesini kaydet (ilk görüldüğünde)
-      if (prices.upTokenId && !_tokenMeta[prices.upTokenId]) {
-        _tokenMeta[prices.upTokenId]   = { name, dir: 'UP' };
-        _tokenMeta[prices.downTokenId] = { name, dir: 'DOWN' };
+      // Latency lab: REST'ten gelen PM fiyatlarını da recorder'a besle
+      if (prices.askUp || prices.askDown) {
+        _rec.onPmBook(name, { askUp: prices.askUp, askDown: prices.askDown });
       }
 
       if (!prices.askUp || !prices.askDown) {
@@ -733,42 +777,76 @@ async function main() {
         rows.push(row); continue;
       }
 
-      // FIRE
+      // Korelasyon koruması: aynı 5dk slot'unda tek pozisyon, en yüksek confidence kazanır
+      const roundSlot   = Math.floor(endMs / (5 * 60_000));
+      const profitIfWin = parseFloat((1 - askPrice).toFixed(4));
+      const estShares   = Math.floor(TRADE_AMOUNT / askPrice);
+      const confPct     = (confidence * 100).toFixed(3);
+
+      if (snipedRoundSlots.has(roundSlot)) {
+        snipedSlugs.add(market.slug);
+        const winner = snipedRoundSlots.get(roundSlot);
+        row.status = `Corr.skip — slot ${winner?.name ?? '?'} aldı`;
+      } else {
+        const cur = pendingFires.get(roundSlot);
+        if (!cur || confidence > cur.confidence) {
+          if (cur) {
+            snipedSlugs.add(cur.market.slug);
+            cur.row.status = `Corr.skip — ${name} daha yüksek conf (${confPct}%)`;
+          }
+          pendingFires.set(roundSlot, { name, direction, askPrice, tokenId, estShares, profitIfWin, confPct, market, endMs, st, row, binancePrice, strikePrice, confidence });
+          row.status = `⏳ ${direction}@${askPrice.toFixed(3)} conf:${confPct}% — ateş bekliyor`;
+        } else {
+          snipedSlugs.add(market.slug);
+          row.status = `Corr.skip — ${cur.name} daha yüksek conf (${(cur.confidence * 100).toFixed(3)}%)`;
+        }
+      }
+      rows.push(row);
+    }
+
+    // Korelasyon koruması: en yüksek confidence'lı adayı ateşle (round başına tek pozisyon)
+    for (const [roundSlot, c] of pendingFires) {
+      const { name, direction, askPrice, tokenId, estShares, profitIfWin, confPct, market, endMs, st, row, binancePrice, strikePrice, confidence } = c;
+      snipedRoundSlots.set(roundSlot, { name, confidence });
       snipedSlugs.add(market.slug);
-      const profitIfWin  = parseFloat((1 - askPrice).toFixed(4));
-      const estShares    = Math.floor(TRADE_AMOUNT / askPrice);
-      const confPct      = (confidence * 100).toFixed(3);
 
       if (!CONFIG.trading.enabled) {
-        row.status = `⚡ DRY RUN ${direction}@${askPrice.toFixed(3)} | conf:${confPct}% | ~${estShares} shares`;
-        log(`⚡ [5m/${name}] DRY ${direction}@$${askPrice.toFixed(3)} | conf:${confPct}% | ~${estShares}sh | rem:${formatRem(remainingMs)}`);
+        row.status = `⚡ DRY ${direction}@${askPrice.toFixed(3)} | conf:${confPct}% | ~${estShares}sh`;
+        log(`⚡ [5m/${name}] DRY ${direction}@$${askPrice.toFixed(3)} | conf:${confPct}% | ~${estShares}sh`);
         notifyTrade({ asset: `5m/${name}`, side: direction, price: askPrice, amount: TRADE_AMOUNT, shares: estShares, type: "DRY RUN" });
         st.stats.trades.push({ slug: market.slug, side: direction, askPrice, amount: TRADE_AMOUNT, shares: estShares, profitIfWin: estShares * profitIfWin, confidence, strikePrice, binancePrice, marketEndMs: endMs, settled: false, dryRun: true, pre150s: preSignals[market.slug] ?? null });
         saveStats(name, st.stats);
-        rows.push(row); continue;
+        continue;
       }
 
       try {
         const result = await trader.executeTrade(tokenId, direction, TRADE_AMOUNT, false, askPrice);
         const shares = result.fillShares || estShares;
         const trade  = { slug: market.slug, side: direction, askPrice, amount: TRADE_AMOUNT, shares, profitIfWin: parseFloat((shares * profitIfWin).toFixed(4)), tokenId, confidence, strikePrice, binancePrice, marketEndMs: endMs, settled: false, pre150s: preSignals[market.slug] ?? null };
-        st.stats.trades.push(trade);
-        saveStats(name, st.stats);
-
         if (result.success) {
-          row.status = `⚡ LIVE ${direction}@${askPrice.toFixed(3)} | conf:${confPct}% | ${shares} shares`;
+          st.stats.trades.push(trade);
+          saveStats(name, st.stats);
+          row.status = `⚡ LIVE ${direction}@${askPrice.toFixed(3)} | conf:${confPct}% | ${shares}sh`;
           log(`⚡ [5m/${name}] LIVE ${direction}@$${askPrice.toFixed(3)} | conf:${confPct}% | profit if win: $${trade.profitIfWin.toFixed(2)}`);
           notifyTrade({ asset: `5m/${name}`, side: direction, price: askPrice, amount: TRADE_AMOUNT, shares, type: "LIVE" });
         } else {
+          // Emir dolmadı — slotu ve slug'u serbest bırak, bir sonraki poll'da yeniden denensin
+          snipedRoundSlots.delete(roundSlot);
+          snipedSlugs.delete(market.slug);
           row.status = `Failed: ${result.error}`;
-          log(`❌ [5m/${name}] Order failed: ${result.error}`);
+          log(`❌ [5m/${name}] Order failed (slot serbest): ${result.error}`);
         }
       } catch (e) {
+        snipedRoundSlots.delete(roundSlot);
+        snipedSlugs.delete(market.slug);
         row.status = `Error: ${e.message}`;
-        log(`❌ [5m/${name}] ${e.message}`);
+        log(`❌ [5m/${name}] ${e.message} (slot serbest)`);
       }
+    }
 
-      rows.push(row);
+    // Süresi dolmuş slot kayıtlarını temizle (>10dk geçmiş)
+    for (const [slot] of snipedRoundSlots) {
+      if (slot * 5 * 60_000 < now - 10 * 60_000) snipedRoundSlots.delete(slot);
     }
 
     renderDashboard(rows, now);
