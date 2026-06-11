@@ -455,13 +455,28 @@ async function settleOpenTrades(name, assetConf, stats) {
     if (trade.result === "WIN") stats.wins++;
     else stats.losses++;
 
+    // Kayıp anatomisi: T=0'daki Binance fiyatı vs. settlement yönü
+    // distToStrikeAtEnd küçükse → fiyat reversal yaşamış, Chainlink/Binance ayrışma riski yüksek
+    try {
+      const closeAtEnd = await fetchBinanceKlineClose(assetConf.conf.symbol, trade.marketEndMs);
+      if (closeAtEnd && trade.strikePrice) {
+        const dist = (closeAtEnd - trade.strikePrice) / trade.strikePrice;
+        trade.binanceCloseAtEnd   = parseFloat(closeAtEnd.toFixed(6));
+        trade.distToStrikeAtEnd   = parseFloat(dist.toFixed(6));
+        trade.binanceDirection    = dist >= 0 ? 'UP' : 'DOWN';
+        trade.settlementDirection = winner;
+        trade.diverged            = trade.binanceDirection !== winner;
+      }
+    } catch { /* pasif — settlement'ı engelleme */ }
+
     const pnl = trade.result === "WIN"
       ? parseFloat(((trade.shares || 0) * (1 - (trade.askPrice || 0))).toFixed(2))
       : -(trade.amount || 0);
 
     const icon = trade.result === "WIN" ? "✅" : "❌";
-    log(`${icon} [5m/${name}] ${trade.side} → ${trade.result} | P&L:${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)} | winner:${winner}`);
-    notifyResult({ asset: `5m/${name}`, side: trade.side, result: trade.result, pnl, type: trade.dryRun ? "DRY" : "LIVE" });
+    const divTag = trade.diverged === true ? ' ⚡DIV' : '';
+    log(`${icon} [5m/${name}] ${trade.side} → ${trade.result} | P&L:${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)} | dist@end:${trade.distToStrikeAtEnd != null ? (trade.distToStrikeAtEnd * 100).toFixed(3) + '%' : '?'}${divTag}`);
+    notifyResult({ asset: `5m/${name}`, side: trade.side, result: trade.result, pnl, type: trade.dryRun ? "DRY" : "LIVE", distAtEnd: trade.distToStrikeAtEnd, diverged: trade.diverged });
     changed = true;
   }
   return changed;
