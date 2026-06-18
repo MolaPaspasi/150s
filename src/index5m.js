@@ -454,7 +454,7 @@ async function settleOpenTrades(name, assetConf, stats) {
     trade.settled = true;
     trade.result  = trade.side === winner ? "WIN" : "LOSS";
     if (trade.result === "WIN") stats.wins++;
-    else stats.losses++;
+    else { stats.losses++; lastLossMs = Date.now(); }
 
     // Kayıp anatomisi: T=0'daki Binance fiyatı vs. settlement yönü
     // distToStrikeAtEnd küçükse → fiyat reversal yaşamış, Chainlink/Binance ayrışma riski yüksek
@@ -629,6 +629,10 @@ function renderDashboard(rows, now) {
 
 // slug → { direction, confidence, binancePrice, strikePrice, recordedAt }
 const preSignals = {};
+// Circuit breaker: son kayıp zamanı — tüm assetlerde ortaklaşa takip edilir
+let lastLossMs = 0;
+const LOSS_COOLDOWN_MS = 30 * 60_000; // kayıptan sonra 30dk bekle
+const BLOCK_UTC_HOURS  = new Set([14]);  // 14:00-14:59 UTC = 17:00-17:59 TR (ABD açılışı)
 
 async function main() {
   const trader      = new TradingEngine();
@@ -769,6 +773,20 @@ async function main() {
       }
       if (confidence > MAX_CONFIDENCE) {
         row.status = `Skip — conf ${(confidence*100).toFixed(3)}% > ${(MAX_CONFIDENCE*100).toFixed(2)}% (aşırı hareket)`;
+        rows.push(row); continue;
+      }
+
+      // 14:00 UTC filtresi: ABD açılış saati — veri: 7W/5L (%58 WR vs %82 BE)
+      const _utcHour = new Date(now).getUTCHours();
+      if (BLOCK_UTC_HOURS.has(_utcHour)) {
+        row.status = `Skip — 14UTC kara saat (${_utcHour+3}:xx TR)`;
+        rows.push(row); continue;
+      }
+
+      // Circuit breaker: son 30dk içinde herhangi bir asset kayıp yaşadıysa atla
+      if (lastLossMs && now - lastLossMs < LOSS_COOLDOWN_MS) {
+        const waitMin = Math.ceil((LOSS_COOLDOWN_MS - (now - lastLossMs)) / 60_000);
+        row.status = `Skip — kayıp sonrası bekleme (${waitMin}dk kaldı)`;
         rows.push(row); continue;
       }
 
