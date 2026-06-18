@@ -165,6 +165,7 @@ function getBinancePrice(name) {
 const openingPriceCache = {};
 
 async function fetchBinanceKlineClose(symbol, marketEndMs) {
+  if (marketEndMs % 60_000 !== 0) log(`⚠️ kline hizalama: marketEndMs dakika sınırında değil (${marketEndMs})`);
   try {
     // 1. Market bitiş anında AÇILAN mumu al → open fiyatı = T anındaki fiyat
     //    (Chainlink oracle da bu anı kullanır)
@@ -201,7 +202,7 @@ async function getOpeningPrice(name, conf, market) {
   if (Date.now() - startMs < 3 * 60_000) {
     const current = getBinancePrice(name);
     if (current) {
-      openingPriceCache[slug] = { price: current, fetchedAt: Date.now() };
+      openingPriceCache[slug] = { price: current, fetchedAt: Date.now(), strikeSource: 'live', strikeDelay: Date.now() - startMs };
       return current;
     }
   }
@@ -209,7 +210,7 @@ async function getOpeningPrice(name, conf, market) {
   // 2. Eski market — Binance REST'ten açılış klinesi çek
   const historical = await fetchBinanceKlineClose(conf.symbol, startMs);
   if (historical) {
-    openingPriceCache[slug] = { price: historical, fetchedAt: Date.now() };
+    openingPriceCache[slug] = { price: historical, fetchedAt: Date.now(), strikeSource: 'kline', strikeDelay: null };
     return historical;
   }
 
@@ -856,7 +857,8 @@ async function main() {
         row.status = `⚡ DRY ${direction}@${askPrice.toFixed(3)} | conf:${confPct}% | ~${estShares}sh`;
         log(`⚡ [5m/${name}] DRY ${direction}@$${askPrice.toFixed(3)} | conf:${confPct}% | ~${estShares}sh`);
         notifyTrade({ asset: `5m/${name}`, side: direction, price: askPrice, amount: TRADE_AMOUNT, shares: estShares, type: "DRY RUN" });
-        st.stats.trades.push({ slug: market.slug, side: direction, askPrice, amount: TRADE_AMOUNT, shares: estShares, profitIfWin: estShares * profitIfWin, confidence, strikePrice, binancePrice, marketEndMs: endMs, settled: false, dryRun: true, pre150s: preSignals[market.slug] ?? null });
+        const _volDry = getRollingVol(name);
+        st.stats.trades.push({ slug: market.slug, side: direction, askPrice, amount: TRADE_AMOUNT, shares: estShares, profitIfWin: estShares * profitIfWin, confidence, strikePrice, binancePrice, marketEndMs: endMs, settled: false, dryRun: true, pre150s: preSignals[market.slug] ?? null, volZ: _volDry ? parseFloat((confidence/_volDry).toFixed(3)) : null, strikeSource: openingPriceCache[market.slug]?.strikeSource ?? null, strikeDelay: openingPriceCache[market.slug]?.strikeDelay ?? null });
         saveStats(name, st.stats);
         continue;
       }
@@ -865,7 +867,7 @@ async function main() {
         const result = await trader.executeTrade(tokenId, direction, TRADE_AMOUNT, false, askPrice);
         const shares = result.fillShares || estShares;
         const _vol = getRollingVol(name);
-        const trade  = { slug: market.slug, side: direction, askPrice, amount: TRADE_AMOUNT, shares, profitIfWin: parseFloat((shares * profitIfWin).toFixed(4)), tokenId, confidence, strikePrice, binancePrice, marketEndMs: endMs, settled: false, pre150s: preSignals[market.slug] ?? null, volZ: _vol ? parseFloat((confidence/_vol).toFixed(3)) : null };
+        const trade  = { slug: market.slug, side: direction, askPrice, amount: TRADE_AMOUNT, shares, profitIfWin: parseFloat((shares * profitIfWin).toFixed(4)), tokenId, confidence, strikePrice, binancePrice, marketEndMs: endMs, settled: false, pre150s: preSignals[market.slug] ?? null, volZ: _vol ? parseFloat((confidence/_vol).toFixed(3)) : null, strikeSource: openingPriceCache[market.slug]?.strikeSource ?? null, strikeDelay: openingPriceCache[market.slug]?.strikeDelay ?? null };
         if (result.success) {
           st.stats.trades.push(trade);
           saveStats(name, st.stats);
@@ -873,17 +875,16 @@ async function main() {
           log(`⚡ [5m/${name}] LIVE ${direction}@$${askPrice.toFixed(3)} | conf:${confPct}% | profit if win: $${trade.profitIfWin.toFixed(2)}`);
           notifyTrade({ asset: `5m/${name}`, side: direction, price: askPrice, amount: TRADE_AMOUNT, shares, type: "LIVE" });
         } else {
-          // Emir dolmadı — slotu ve slug'u serbest bırak, bir sonraki poll'da yeniden denensin
+          // Slug kilitli kalır — aynı round'a tekrar girme (emir PM'de dolmuş olabilir)
+          // Sadece slot serbest bırakılır: başka bir asset bu round'u alabilsin
           snipedRoundSlots.delete(roundSlot);
-          snipedSlugs.delete(market.slug);
-          row.status = `Failed: ${result.error}`;
-          log(`❌ [5m/${name}] Order failed (slot serbest): ${result.error}`);
+          row.status = `Failed (slug kilitli): ${result.error}`;
+          log(`❌ [5m/${name}] Order failed (slug kilitli, slot serbest): ${result.error}`);
         }
       } catch (e) {
         snipedRoundSlots.delete(roundSlot);
-        snipedSlugs.delete(market.slug);
-        row.status = `Error: ${e.message}`;
-        log(`❌ [5m/${name}] ${e.message} (slot serbest)`);
+        row.status = `Error (slug kilitli): ${e.message}`;
+        log(`❌ [5m/${name}] ${e.message} (slug kilitli, slot serbest)`);
       }
     }
 
